@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/wyw14/solo-038/internal/dryer"
 	"github.com/wyw14/solo-038/internal/model"
 	"github.com/wyw14/solo-038/internal/unwind"
 )
@@ -18,7 +19,7 @@ type Operation struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
-func (runtime *Runtime) CreateOperation(ctx context.Context, kind string) (Operation, error) {
+func (runtime *Runtime) CreateOperation(ctx context.Context, kind string, dryerProfile string) (Operation, error) {
 	if kind == "" {
 		return Operation{}, fmt.Errorf("operation kind is required")
 	}
@@ -31,10 +32,29 @@ func (runtime *Runtime) CreateOperation(ctx context.Context, kind string) (Opera
 	if !ok {
 		return Operation{}, fmt.Errorf("there is no active job")
 	}
-	if err := runtime.ExecuteOperation(ctx, kind); err != nil {
+	if err := runtime.ExecuteOperation(ctx, kind, dryerProfile); err != nil {
 		return Operation{}, err
 	}
 	return Operation{ID: model.NewOperationID(), Kind: kind, JobID: jobValue.ID, Status: "accepted", CreatedAt: time.Now().UTC()}, nil
+}
+
+func (runtime *Runtime) DryerProfiles() []dryer.CatalogProfile {
+	return runtime.dryerCatalog.List()
+}
+
+// DryerSteady reports whether every zone of the active dryer profile has
+// reached measured steady state for the running job.
+func (runtime *Runtime) DryerSteady() bool {
+	_, _, _, zones, _, active := runtime.dryer.Snapshot()
+	if !active || len(zones) == 0 {
+		return false
+	}
+	for _, zone := range zones {
+		if !zone.Steady {
+			return false
+		}
+	}
+	return true
 }
 
 func (runtime *Runtime) Equipment() []map[string]any {
@@ -53,8 +73,8 @@ func (runtime *Runtime) Equipment() []map[string]any {
 
 func (runtime *Runtime) dryerControlStatus() map[string]any {
 	status, errors := runtime.dryerControl.Status()
-	jobID, generation, target, current, profile, active := runtime.dryer.Snapshot()
-	return map[string]any{"startup": status, "errors": errors, "job_id": jobID, "generation": generation, "target": target, "current": current, "profile": profile, "active": active}
+	jobID, generation, profile, zones, segments, active := runtime.dryer.Snapshot()
+	return map[string]any{"startup": status, "errors": errors, "job_id": jobID, "generation": generation, "profile": profile, "zones": zones, "segments": segments, "active": active}
 }
 
 func (runtime *Runtime) LoadRoll(roll unwind.Roll) (uint64, error) {

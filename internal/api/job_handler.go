@@ -7,7 +7,8 @@ import (
 )
 
 type operationRequest struct {
-	Kind string `json:"kind"`
+	Kind         string `json:"kind"`
+	DryerProfile string `json:"dryer_profile"`
 }
 
 func (handler *Handler) operations(writer http.ResponseWriter, request *http.Request) {
@@ -25,7 +26,7 @@ func (handler *Handler) createOperation(writer http.ResponseWriter, request *htt
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	operation, err := handler.runtime.CreateOperation(request.Context(), input.Kind)
+	operation, err := handler.runtime.CreateOperation(request.Context(), input.Kind, input.DryerProfile)
 	if err != nil {
 		writeError(writer, http.StatusConflict, err)
 		return

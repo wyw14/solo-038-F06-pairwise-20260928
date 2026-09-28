@@ -29,7 +29,7 @@ var commandKinds = map[string]model.CommandKind{
 	"switch_ink":   model.CommandInkRoute,
 }
 
-func (runtime *Runtime) ExecuteOperation(ctx context.Context, kind string) error {
+func (runtime *Runtime) ExecuteOperation(ctx context.Context, kind string, dryerProfile string) error {
 	current, ok := runtime.jobs.Current()
 	if !ok {
 		return fmt.Errorf("there is no active job")
@@ -56,7 +56,9 @@ func (runtime *Runtime) ExecuteOperation(ctx context.Context, kind string) error
 	case "ink_fault":
 		return runtime.switchInkOperation(true)
 	case "start_dryer":
-		return runtime.startDryerOperation(ctx, current)
+		return runtime.startDryerOperation(current, dryerProfile)
+	case "switch_dryer_profile":
+		return runtime.switchDryerProfileOperation(current, dryerProfile)
 	case "release_interval":
 		return runtime.releaseOperation(current)
 	case "finish_output":
@@ -90,7 +92,7 @@ func (runtime *Runtime) loadRollOperation(current model.Job) error {
 func (runtime *Runtime) feedWebOperation(ctx context.Context, current model.Job) error {
 	now := time.Now()
 	forceA := sensor.Reading{ID: string(model.NewOperationID()), Kind: sensor.ReadingForce, Source: "load-cell-a", Origin: "load-cell-a", Value: 90, Unit: "N", ObservedAt: now}
-	forceB := sensor.Reading{ID: string(model.NewOperationID()), Kind: sensor.ReadingForce, Source: "load-cell-b", Origin: "load-cell-b", Value: 91, Unit: "N", ObservedAt: now}
+	forceB := sensor.Reading{ID: string(model.NewOperationID()), Kind: sensor.ReadingForce, Source: "load-cell-b", Origin: "load-cell-b", Value: 90.1, Unit: "N", ObservedAt: now}
 	tension, err := sensor.DeriveTension(forceA, 10, string(model.NewOperationID()))
 	if err != nil {
 		return err
@@ -119,6 +121,9 @@ func (runtime *Runtime) feedWebOperation(ctx context.Context, current model.Job)
 	if err := runtime.webControl.Advance(string(current.ID), 1, permit, now); err != nil {
 		return err
 	}
+	if err := runtime.observeDryer(current, now); err != nil {
+		return err
+	}
 	loopCtx, cancel := context.WithCancel(ctx)
 	result := web.RunControlLoop(loopCtx, time.Millisecond, 8, func(float64) {})
 	cancel()
@@ -126,6 +131,23 @@ func (runtime *Runtime) feedWebOperation(ctx context.Context, current model.Job)
 		return err
 	}
 	return runtime.verifyPath(readings)
+}
+
+// observeDryer advances the dryer segment ledger to the current web meter so
+// dried spans track the paper actually fed. It is a no-op while the dryer is
+// not running for this job.
+func (runtime *Runtime) observeDryer(current model.Job, now time.Time) error {
+	jobID, generation, _, _, _, active := runtime.dryer.Snapshot()
+	if !active || jobID != string(current.ID) || generation != current.Generation {
+		return nil
+	}
+	_, _, _, _, meter := runtime.web.Snapshot()
+	return runtime.dryer.Observe(jobID, generation, meter, now)
+}
+
+func (runtime *Runtime) webMeter() float64 {
+	_, _, _, _, meter := runtime.web.Snapshot()
+	return meter
 }
 
 func (runtime *Runtime) verifyPath(readings []sensor.Reading) error {
@@ -169,10 +191,11 @@ func (runtime *Runtime) registerOperation(current model.Job) error {
 		return err
 	}
 	current.PlateGeneration = plateGeneration
-	if err := runtime.register.Start(current.Generation, plateGeneration, 0, now); err != nil {
+	meter := runtime.webMeter()
+	if err := runtime.register.Start(current.Generation, plateGeneration, meter, now); err != nil {
 		return err
 	}
-	frame := sensor.CameraFrame{ID: string(model.NewOperationID()), Camera: "register-camera", JobGeneration: current.Generation, PlateGeneration: plateGeneration, WebMeter: 1, Offset: 0.04, CapturedAt: now, ReceivedAt: now.Add(time.Millisecond)}
+	frame := sensor.CameraFrame{ID: string(model.NewOperationID()), Camera: "register-camera", JobGeneration: current.Generation, PlateGeneration: plateGeneration, WebMeter: meter + 1, Offset: 0.04, CapturedAt: now, ReceivedAt: now.Add(time.Millisecond)}
 	runtime.sensors.PutFrame(frame)
 	if err := runtime.registerControl.AcceptFrame(frame, runtime.config.RegisterGap); err != nil {
 		return err
@@ -229,26 +252,62 @@ func (runtime *Runtime) switchInkOperation(withFault bool) error {
 	return ink.RequireReady(runtime.ink, active)
 }
 
-func (runtime *Runtime) startDryerOperation(ctx context.Context, current model.Job) error {
-	profile := dryer.Profile{Name: "production", Zones: []dryer.Zone{{Name: "entry", Temperature: 80, Airflow: 20}, {Name: "exit", Temperature: 100, Airflow: 24}}}
+// startDryerOperation starts the dryer on an approved zone profile selected by
+// the job. An empty profile name falls back to the default "production"
+// profile. Zones ramp sequentially from their measured temperatures.
+func (runtime *Runtime) startDryerOperation(current model.Job, profileName string) error {
+	if profileName == "" {
+		profileName = "production"
+	}
+	profile, err := runtime.dryerCatalog.Approved(profileName)
+	if err != nil {
+		return err
+	}
 	if profile.MaximumTemperature() <= 0 || profile.AverageAirflow() <= 0 {
 		return fmt.Errorf("dryer profile is invalid")
 	}
 	if err := runtime.dryerControl.Startup(nil, true); err != nil {
 		return err
 	}
-	if err := runtime.jobControl.StartDryerRamp(ctx, current, profile.MaximumTemperature(), 10*time.Millisecond); err != nil {
+	if err := runtime.jobControl.StartDryerRamp(current, profile, runtime.webMeter(), 10*time.Millisecond); err != nil {
 		return err
 	}
 	_ = runtime.jobControl.DryerTemperature()
 	return nil
 }
 
+// switchDryerProfileOperation moves the running job to a different approved
+// profile. The segment ledger keeps the old profile's segment closed at the
+// current meter and opens a new segment for the new profile.
+func (runtime *Runtime) switchDryerProfileOperation(current model.Job, profileName string) error {
+	if profileName == "" {
+		return fmt.Errorf("dryer profile is required")
+	}
+	profile, err := runtime.dryerCatalog.Approved(profileName)
+	if err != nil {
+		return err
+	}
+	if profile.MaximumTemperature() <= 0 || profile.AverageAirflow() <= 0 {
+		return fmt.Errorf("dryer profile is invalid")
+	}
+	return runtime.jobControl.SwitchDryerProfile(current, profile, runtime.webMeter(), 10*time.Millisecond)
+}
+
 func (runtime *Runtime) releaseOperation(current model.Job) error {
 	now := time.Now()
 	window := runtime.register.Snapshot()
 	interval := model.Interval{JobID: current.ID, JobGeneration: current.Generation, RollGeneration: current.RollGeneration, StartMeter: window.StartMeter, EndMeter: window.LastMeter, OpenedAt: window.StartedAt, ClosedAt: now}
-	proof, err := dryer.BuildProof(current, interval, 100, 24, now)
+	jobID, generation, profile, zones, _, active := runtime.dryer.Snapshot()
+	if !active || jobID != string(current.ID) || generation != current.Generation {
+		return fmt.Errorf("dryer is not running an approved profile for this job")
+	}
+	if err := runtime.observeDryer(current, now); err != nil {
+		return err
+	}
+	if err := runtime.dryer.RangeFullyDried(jobID, generation, interval.StartMeter, interval.EndMeter, runtime.webMeter()); err != nil {
+		return err
+	}
+	proof, err := dryer.BuildProof(current, interval, profile, zones, now)
 	if err != nil {
 		return err
 	}
