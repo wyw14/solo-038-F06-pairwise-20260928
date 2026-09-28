@@ -18,8 +18,17 @@ type Operation struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
-func (runtime *Runtime) CreateOperation(ctx context.Context, kind string) (Operation, error) {
-	if kind == "" {
+// OperationInput carries optional parameters for an operation. DryerProfile
+// selects the approved drying curve; BoundaryMeter (>0) marks where a profile
+// switch closes the current segment.
+type OperationInput struct {
+	Kind          string
+	DryerProfile  string
+	BoundaryMeter float64
+}
+
+func (runtime *Runtime) CreateOperation(ctx context.Context, input OperationInput) (Operation, error) {
+	if input.Kind == "" {
 		return Operation{}, fmt.Errorf("operation kind is required")
 	}
 	select {
@@ -31,10 +40,10 @@ func (runtime *Runtime) CreateOperation(ctx context.Context, kind string) (Opera
 	if !ok {
 		return Operation{}, fmt.Errorf("there is no active job")
 	}
-	if err := runtime.ExecuteOperation(ctx, kind); err != nil {
+	if err := runtime.ExecuteOperation(ctx, input); err != nil {
 		return Operation{}, err
 	}
-	return Operation{ID: model.NewOperationID(), Kind: kind, JobID: jobValue.ID, Status: "accepted", CreatedAt: time.Now().UTC()}, nil
+	return Operation{ID: model.NewOperationID(), Kind: input.Kind, JobID: jobValue.ID, Status: "accepted", CreatedAt: time.Now().UTC()}, nil
 }
 
 func (runtime *Runtime) Equipment() []map[string]any {
@@ -53,8 +62,9 @@ func (runtime *Runtime) Equipment() []map[string]any {
 
 func (runtime *Runtime) dryerControlStatus() map[string]any {
 	status, errors := runtime.dryerControl.Status()
-	jobID, generation, target, current, profile, active := runtime.dryer.Snapshot()
-	return map[string]any{"startup": status, "errors": errors, "job_id": jobID, "generation": generation, "target": target, "current": current, "profile": profile, "active": active}
+	snapshot := runtime.dryer.Snapshot()
+	profiles := runtime.dryerProfiles.List()
+	return map[string]any{"startup": status, "errors": errors, "job_id": snapshot.JobID, "generation": snapshot.JobGen, "profile": snapshot.Profile, "active": snapshot.Active, "segments": snapshot.Segments, "ready": runtime.jobControl.DryerReady(time.Now()), "profiles": profiles}
 }
 
 func (runtime *Runtime) LoadRoll(roll unwind.Roll) (uint64, error) {

@@ -25,6 +25,9 @@ func NewRouter(runtime *service.Runtime) http.Handler {
 		api.Get("/incidents", handler.incidents)
 		api.Get("/recovery", handler.recoveryStatus)
 		api.Post("/jobs/current/cancel", handler.cancelCurrent)
+		api.Get("/dryer/profiles", handler.dryerProfiles)
+		api.Post("/dryer/profiles", handler.registerDryerProfile)
+		api.Post("/dryer/profiles/{name}/approve", handler.approveDryerProfile)
 	})
 	return router
 }

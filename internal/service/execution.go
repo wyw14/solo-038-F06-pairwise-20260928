@@ -29,7 +29,8 @@ var commandKinds = map[string]model.CommandKind{
 	"switch_ink":   model.CommandInkRoute,
 }
 
-func (runtime *Runtime) ExecuteOperation(ctx context.Context, kind string) error {
+func (runtime *Runtime) ExecuteOperation(ctx context.Context, input OperationInput) error {
+	kind := input.Kind
 	current, ok := runtime.jobs.Current()
 	if !ok {
 		return fmt.Errorf("there is no active job")
@@ -56,7 +57,9 @@ func (runtime *Runtime) ExecuteOperation(ctx context.Context, kind string) error
 	case "ink_fault":
 		return runtime.switchInkOperation(true)
 	case "start_dryer":
-		return runtime.startDryerOperation(ctx, current)
+		return runtime.startDryerOperation(ctx, current, input)
+	case "switch_dryer_profile":
+		return runtime.switchDryerProfileOperation(ctx, current, input)
 	case "release_interval":
 		return runtime.releaseOperation(current)
 	case "finish_output":
@@ -229,33 +232,67 @@ func (runtime *Runtime) switchInkOperation(withFault bool) error {
 	return ink.RequireReady(runtime.ink, active)
 }
 
-func (runtime *Runtime) startDryerOperation(ctx context.Context, current model.Job) error {
-	profile := dryer.Profile{Name: "production", Zones: []dryer.Zone{{Name: "entry", Temperature: 80, Airflow: 20}, {Name: "exit", Temperature: 100, Airflow: 24}}}
-	if profile.MaximumTemperature() <= 0 || profile.AverageAirflow() <= 0 {
-		return fmt.Errorf("dryer profile is invalid")
+func (runtime *Runtime) startDryerOperation(ctx context.Context, current model.Job, input OperationInput) error {
+	profileName := input.DryerProfile
+	if profileName == "" {
+		profileName = "production"
+	}
+	// Only an approved curve may be selected for a job.
+	if _, err := runtime.dryerProfiles.Approved(profileName, time.Now()); err != nil {
+		return err
 	}
 	if err := runtime.dryerControl.Startup(nil, true); err != nil {
 		return err
 	}
-	if err := runtime.jobControl.StartDryerRamp(ctx, current, profile.MaximumTemperature(), 10*time.Millisecond); err != nil {
+	_, _, _, _, meter := runtime.web.Snapshot()
+	if _, err := runtime.jobControl.StartDryerRamp(ctx, current, profileName, meter, 10*time.Millisecond); err != nil {
 		return err
 	}
-	_ = runtime.jobControl.DryerTemperature()
+	if !runtime.jobControl.DryerReady(time.Now()) {
+		return fmt.Errorf("dryer did not reach steady state on all zones")
+	}
 	return nil
+}
+
+func (runtime *Runtime) switchDryerProfileOperation(ctx context.Context, current model.Job, input OperationInput) error {
+	if input.DryerProfile == "" {
+		return fmt.Errorf("dryer profile name is required")
+	}
+	if _, err := runtime.dryerProfiles.Approved(input.DryerProfile, time.Now()); err != nil {
+		return err
+	}
+	_, _, _, _, meter := runtime.web.Snapshot()
+	if _, err := runtime.jobControl.SwitchDryerProfile(ctx, current, input.DryerProfile, boundaryMeter(input.BoundaryMeter, meter), 10*time.Millisecond); err != nil {
+		return err
+	}
+	if !runtime.jobControl.DryerReady(time.Now()) {
+		return fmt.Errorf("switched dryer profile did not reach steady state on all zones")
+	}
+	return nil
+}
+
+func boundaryMeter(explicit, currentMeter float64) float64 {
+	if explicit > 0 {
+		return explicit
+	}
+	return currentMeter
 }
 
 func (runtime *Runtime) releaseOperation(current model.Job) error {
 	now := time.Now()
 	window := runtime.register.Snapshot()
 	interval := model.Interval{JobID: current.ID, JobGeneration: current.Generation, RollGeneration: current.RollGeneration, StartMeter: window.StartMeter, EndMeter: window.LastMeter, OpenedAt: window.StartedAt, ClosedAt: now}
-	proof, err := dryer.BuildProof(current, interval, 100, 24, now)
+	// One proof per profile segment overlapping the interval. If any segment
+	// has a zone that never reached steady state, the whole interval is
+	// rejected and must not be recorded as fully dried.
+	segmentProofs, err := dryer.BuildSegmentProofs(current, interval, runtime.dryer, dryer.DefaultTolerance, dryer.DefaultDwell, now)
 	if err != nil {
 		return err
 	}
-	if !proof.Covers(interval) {
-		return fmt.Errorf("dryer proof does not cover interval")
+	proofs := model.ProofSet{Interval: interval, Proofs: dryer.Models(segmentProofs)}
+	if !proofs.Complete("dryer") {
+		return fmt.Errorf("dryer proofs do not cover the whole interval")
 	}
-	proofs := model.ProofSet{Interval: interval, Proofs: []model.Proof{proof.Proof}}
 	_ = proofs.Sources()
 	if err := registerpkg.ReleaseWithProofs(runtime.registerControl, current, model.NewOperationID(), proofs.Proofs, true, now); err != nil {
 		return err

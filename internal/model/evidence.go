@@ -19,6 +19,7 @@ type Interval struct {
 type Proof struct {
 	Kind           string    `json:"kind"`
 	Source         string    `json:"source"`
+	Profile        string    `json:"profile,omitempty"`
 	JobGeneration  uint64    `json:"job_generation"`
 	RollGeneration uint64    `json:"roll_generation"`
 	ValidFrom      float64   `json:"valid_from"`
@@ -45,27 +46,50 @@ func (interval Interval) Validate() error {
 }
 
 func (set ProofSet) Complete(required ...string) bool {
-	wanted := make(map[string]bool, len(required))
 	for _, kind := range required {
-		wanted[kind] = false
-	}
-	for _, proof := range set.Proofs {
-		if proof.JobGeneration != set.Interval.JobGeneration || proof.RollGeneration != set.Interval.RollGeneration {
-			continue
-		}
-		if proof.ValidFrom > set.Interval.StartMeter || proof.ValidTo < set.Interval.EndMeter {
-			continue
-		}
-		if _, ok := wanted[proof.Kind]; ok {
-			wanted[proof.Kind] = true
-		}
-	}
-	for _, present := range wanted {
-		if !present {
+		if !set.CoversKind(kind) {
 			return false
 		}
 	}
 	return true
+}
+
+// CoversKind reports whether proofs of one kind jointly span the whole
+// interval without gaps, preserving boundaries between adjacent proofs.
+func (set ProofSet) CoversKind(kind string) bool {
+	type span struct{ from, to float64 }
+	spans := []span{}
+	for _, proof := range set.Proofs {
+		if proof.Kind != kind || proof.JobGeneration != set.Interval.JobGeneration || proof.RollGeneration != set.Interval.RollGeneration {
+			continue
+		}
+		if proof.ValidFrom > set.Interval.EndMeter || proof.ValidTo < set.Interval.StartMeter {
+			continue
+		}
+		from := proof.ValidFrom
+		if from < set.Interval.StartMeter {
+			from = set.Interval.StartMeter
+		}
+		to := proof.ValidTo
+		if to > set.Interval.EndMeter {
+			to = set.Interval.EndMeter
+		}
+		spans = append(spans, span{from: from, to: to})
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].from < spans[j].from })
+	cursor := set.Interval.StartMeter
+	for _, value := range spans {
+		if value.from > cursor {
+			return false
+		}
+		if value.to > cursor {
+			cursor = value.to
+		}
+		if cursor >= set.Interval.EndMeter {
+			return true
+		}
+	}
+	return false
 }
 
 func (set ProofSet) Sources() []string {

@@ -51,6 +51,7 @@ type Runtime struct {
 	registerControl *register.Coordinator
 	dryer           *dryer.State
 	dryerControl    *dryer.Coordinator
+	dryerProfiles   *dryer.Registry
 	folder          *folder.State
 	folderControl   *folder.Controller
 	splice          *splice.State
@@ -68,6 +69,7 @@ func NewRuntime(config Config) (*Runtime, error) {
 	}
 	journalStore := journal.NewStore(filepath.Join(config.DataDir, "events.jsonl"))
 	dryerState := dryer.NewState()
+	dryerProfiles := dryer.DefaultRegistry()
 	jobState := job.NewState()
 	unwindState := unwind.NewState()
 	webState := web.NewState()
@@ -81,7 +83,7 @@ func NewRuntime(config Config) (*Runtime, error) {
 	folderState := folder.NewState()
 	spliceState := splice.NewState()
 	festoon := unwind.NewFestoon(config.FestoonCapacity)
-	runtime := &Runtime{startedAt: time.Now().UTC(), config: config, journal: journalStore, jobs: jobState, jobControl: job.NewCoordinator(jobState, dryerState), sensors: sensor.NewState(), unwind: unwindState, loader: unwind.NewLoader(unwindState), festoon: festoon, web: webState, webControl: web.NewCoordinator(webState, path), press: pressState, pressUnits: pressController, pressControl: press.NewCoordinator(pressController, pressState), phase: press.NewPhaseController(pressState, 2.5), ink: inkState, register: registerState, registerControl: register.NewCoordinator(registerState, journalStore), dryer: dryerState, dryerControl: dryer.NewCoordinator(dryerState), folder: folderState, folderControl: folder.NewController(folderState), splice: spliceState}
+	runtime := &Runtime{startedAt: time.Now().UTC(), config: config, journal: journalStore, jobs: jobState, jobControl: job.NewCoordinator(jobState, dryerState, dryerProfiles), sensors: sensor.NewState(), unwind: unwindState, loader: unwind.NewLoader(unwindState), festoon: festoon, web: webState, webControl: web.NewCoordinator(webState, path), press: pressState, pressUnits: pressController, pressControl: press.NewCoordinator(pressController, pressState), phase: press.NewPhaseController(pressState, 2.5), ink: inkState, inkControl: ink.NewCoordinator(ink.NewCircuit(inkState)), register: registerState, registerControl: register.NewCoordinator(registerState, journalStore), dryer: dryerState, dryerControl: dryer.NewCoordinator(dryerState), dryerProfiles: dryerProfiles, folder: folderState, folderControl: folder.NewController(folderState), splice: spliceState}
 	runtime.inkControl = ink.NewCoordinator(ink.NewCircuit(inkState))
 	runtime.spliceControl = splice.NewCoordinator(spliceState, festoon, splice.NewLeaseManager())
 	return runtime, nil
